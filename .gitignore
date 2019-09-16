@@ -1,3 +1,8 @@
 build
 distclean
 .clang-format
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+.vscode
