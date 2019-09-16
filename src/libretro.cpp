@@ -1,45 +1,63 @@
-#include "neogeocd.h"
-#include "timeprofiler.h"
-
 #include <algorithm>
 #include <cmath>
+#include <compat/posix_string.h>
+#include <compat/strl.h>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <file/archive_file.h>
+#include <file/file_path.h>
+#include <initializer_list>
+#include <lists/dir_list.h>
+#include <lists/string_list.h>
 #include <vector>
 
-class BiosListEntry
-{
-public:
-    BiosListEntry(const std::string& f, const std::string& d, NeoGeoCD::BiosType t) :
-        filename(f),
-        description(d),
-        type(t)
-    { }
+#include "neogeocd.h"
+#include "path.h"
+#include "stringlist.h"
+#include "timeprofiler.h"
 
-    std::string         filename;
-    std::string         description;
+struct KnownBiosListEntry
+{
+    const char* filename;
+    const char* description;
     NeoGeoCD::BiosType type;
+    bool isSMKDan;
+    bool isUniverse;
 };
 
-static const char* BIOS_F_FILENAME = "neocd_f.rom";
-static const char* BIOS_F_DESCRIPTION = "Front Loader";
-static const char* BIOS_SF_FILENAME = "neocd_sf.rom";
-static const char* BIOS_SF_DESCRIPTION = "Front Loader (SMKDAN)";
-static const char* BIOS_T_FILENAME = "neocd_t.rom";
-static const char* BIOS_T_DESCRIPTION = "Top Loader";
-static const char* BIOS_ST_FILENAME = "neocd_st.rom";
-static const char* BIOS_ST_DESCRIPTION = "Top Loader (SMKDAN)";
-static const char* BIOS_Z_FILENAME = "neocd_z.rom";
-static const char* BIOS_Z_DESCRIPTION = "CDZ";
-static const char* BIOS_SZ_FILENAME = "neocd_sz.rom";
-static const char* BIOS_SZ_DESCRIPTION = "CDZ (SMKDAN)";
+struct BiosListEntry
+{
+    std::string filename;
+    const KnownBiosListEntry* biosEntry;
+};
 
+// List of all known BIOS filenames
+static const std::initializer_list<KnownBiosListEntry> KNOWN_BIOSES{
+    { "neocd_f.rom", "Front Loader", NeoGeoCD::FrontLoader, false, false },
+    { "neocd_sf.rom", "Front Loader (SMKDAN)", NeoGeoCD::FrontLoader, true, false },
+    { "front-sp1.bin", "Front Loader (MAME)", NeoGeoCD::FrontLoader, false, false },
+    { "neocd_t.rom", "Top Loader", NeoGeoCD::TopLoader, false, false },
+    { "neocd_st.rom", "Top Loader (SMKDAN)", NeoGeoCD::TopLoader, true, false },
+    { "top-sp1.bin", "Top Loader (MAME)", NeoGeoCD::TopLoader, false, false },
+    { "neocd_z.rom", "CDZ", NeoGeoCD::CDZ, false, false },
+    { "neocd_sz.rom", "CDZ (SMKDAN)", NeoGeoCD::CDZ, true, false },
+    { "neocd.bin", "CDZ (MAME)", NeoGeoCD::CDZ, false, false },
+    { "uni-bioscd.rom", "Universe 3.2", NeoGeoCD::CDZ, false, true }
+};
+
+// List of all known zoom ROMs
+static const std::initializer_list<const char*> KNOWN_ZOOM_ROMS{
+    { "ng-lo.rom" },
+    { "000-lo.lo" }
+};
+
+// Variable names for the settings
 static const char* REGION_VARIABLE = "neocd_region";
 static const char* BIOS_VARIABLE = "neocd_bios";
 static const char* SPEEDHACK_VARIABLE = "neocd_cdspeedhack";
 static const char* LOADSKIP_VARIABLE = "neocd_loadskip";
 
+// Definition of the Neo Geo arcade stick
 static const struct retro_input_descriptor neogeoCDPadDescriptors[] = {
     { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
     { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
@@ -65,6 +83,7 @@ static const struct retro_input_descriptor neogeoCDPadDescriptors[] = {
     { 0 }
 };
 
+// Input mapping definition
 static const uint8_t padMap[] = {
     RETRO_DEVICE_ID_JOYPAD_LEFT, Input::Left,
     RETRO_DEVICE_ID_JOYPAD_UP, Input::Up,
@@ -76,6 +95,7 @@ static const uint8_t padMap[] = {
     RETRO_DEVICE_ID_JOYPAD_X, Input::D
 };
 
+// Input mapping definition
 static const uint8_t padMap2[] = {
     0, RETRO_DEVICE_ID_JOYPAD_START, Input::Controller1Start,
     0, RETRO_DEVICE_ID_JOYPAD_SELECT, Input::Controller1Select,
@@ -83,86 +103,166 @@ static const uint8_t padMap2[] = {
     1, RETRO_DEVICE_ID_JOYPAD_SELECT, Input::Controller2Select
 };
 
-static const char* systemDirectory = nullptr;
+// Retroarch's system directory
+const char* systemDirectory = nullptr;
 
+// Collection of callbacks to the things we need
 LibretroCallbacks libretro = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 
+// List of all BIOSes found
 static std::vector<BiosListEntry> biosList;
-static int biosIndex = 0;
+
+// Path to the zoom ROM
+static std::string zoomRomFilename;
+
+// Index of currently selected BIOS
+static size_t biosIndex = 0;
+
+// Description of all BIOSes separated by |
 static std::string biosChoices;
 
+// Should we skip CD loading?
 static bool skipCDLoading = true;
+
+// Should we patch the BIOS to lower CPU usage during loading
 static bool cdSpeedHack = false;
 
+// All core variables
 static std::vector<retro_variable> variables;
 
-static std::string makeSystemPath(const std::string& filename)
+static void searchForBIOSInternal(const char* path, const StringList& file_list)
 {
-    std::string result;
+    for(const string_list_elem& elem : file_list)
+    {
+        const char* filename = path_basename(elem.data);
 
-    if (systemDirectory)
-        result = std::string(systemDirectory) + "/neocd/" + filename;
-    else
-        result = filename;
+        // Check the filename against all known BIOS filenames
+        for(const KnownBiosListEntry& entry : KNOWN_BIOSES)
+        {
+            if (string_compare_insensitive(filename, entry.filename))
+            {
+                BiosListEntry newEntry;
 
-    return result;
-}
+                // When scanning an archive, path will be non null. 
+                // We want something of the form archive.zip#file.bin
+                if (path)
+                    newEntry.filename = make_path_separator(path, "#", elem.data);
+                else
+                    newEntry.filename = elem.data;
 
-static bool fileExists(const std::string& filename)
-{
-    std::ifstream file;
-    file.open(filename);
-    if (file.is_open())
-        return true;
+                newEntry.biosEntry = &entry;
+                biosList.push_back(newEntry);
 
-    return false;
+                break;
+            }
+        }
+
+        // Look for a suitable zoom ROM too
+        if (zoomRomFilename.empty())
+        {
+            for(const char* fname : KNOWN_ZOOM_ROMS)
+            {
+                if (string_compare_insensitive(fname, filename))
+                {
+                    if (path)
+                        zoomRomFilename = make_path_separator(path, "#", elem.data);
+                    else
+                        zoomRomFilename = elem.data;
+
+                    break;
+                }
+            }
+        }
+    }
 }
 
 static void lookForBIOS()
 {
+    const char* const valid_exts = "rom|bin|lo";
+
+    // Clear everything
     biosList.clear();
+    zoomRomFilename.clear();
 
-    if (fileExists(makeSystemPath(BIOS_F_FILENAME)))
-        biosList.emplace_back(BiosListEntry(BIOS_F_FILENAME, BIOS_F_DESCRIPTION, NeoGeoCD::FrontLoader));
+    // Get the system path
+    std::string systemPath = system_path();
 
-    if (fileExists(makeSystemPath(BIOS_SF_FILENAME)))
-        biosList.emplace_back(BiosListEntry(BIOS_SF_FILENAME, BIOS_SF_DESCRIPTION, NeoGeoCD::FrontLoader));
+    // Scan the system directory
+    StringList file_list(dir_list_new(systemPath.c_str(), valid_exts, false, false, false, true));
+    searchForBIOSInternal(nullptr, file_list);
 
-    if (fileExists(makeSystemPath(BIOS_T_FILENAME)))
-        biosList.emplace_back(BiosListEntry(BIOS_T_FILENAME, BIOS_T_DESCRIPTION, NeoGeoCD::TopLoader));
+    // Get a list of all archives present in the system directory...
+    StringList archive_list(dir_list_new(systemPath.c_str(), "", false, false, true, true));
+    for(const string_list_elem& elem : archive_list)
+    {
+        // ...and scan them too
+        file_list = file_archive_get_file_list(elem.data, nullptr);
+        searchForBIOSInternal(elem.data, file_list);
+    }
 
-    if (fileExists(makeSystemPath(BIOS_ST_FILENAME)))
-        biosList.emplace_back(BiosListEntry(BIOS_ST_FILENAME, BIOS_ST_DESCRIPTION, NeoGeoCD::TopLoader));
+    // Sort the list
+    std::sort(biosList.begin(), biosList.end(), [](const BiosListEntry& a, const BiosListEntry& b) {
+        return strcmp(a.biosEntry->description, b.biosEntry->description) < 0;
+    });
 
-    if (fileExists(makeSystemPath(BIOS_Z_FILENAME)))
-        biosList.emplace_back(BiosListEntry(BIOS_Z_FILENAME, BIOS_Z_DESCRIPTION, NeoGeoCD::CDZ));
+    // Make the list unique
+    auto i = std::unique(biosList.begin(), biosList.end(), [](const BiosListEntry& a, const BiosListEntry& b) {
+        return strcmp(a.biosEntry->description, b.biosEntry->description) == 0;
+    });
+    biosList.erase(i, biosList.end());
+}
 
-    if (fileExists(makeSystemPath(BIOS_SZ_FILENAME)))
-        biosList.emplace_back(BiosListEntry(BIOS_SZ_FILENAME, BIOS_SZ_DESCRIPTION, NeoGeoCD::CDZ));
+static bool fileRead(const std::string& path, void* buffer, size_t maximumSize, size_t* reallyRead)
+{
+    size_t wasRead = 0;
+
+    if (!path_contains_compressed_file(path.c_str()))
+    {
+        RFILE* file = filestream_open(path.c_str(), RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+        if (!file)
+            return false;
+
+        wasRead = filestream_read(file, buffer, maximumSize);
+
+        filestream_close(file);
+    }
+    else
+    {
+        void* tempBuffer;
+        int64_t size;
+
+        if (!file_archive_compressed_read(path.c_str(), &tempBuffer, nullptr, &size))
+            return false;
+
+        wasRead = std::min(maximumSize, static_cast<size_t>(size));
+
+        std::memcpy(buffer, tempBuffer, wasRead);
+
+        std::free(tempBuffer);
+    }
+
+    if (reallyRead)
+        *reallyRead = wasRead;
+
+    return true;
 }
 
 static bool loadYZoomROM()
 {
-    std::ifstream file;
-    std::string filename;
+    size_t reallyRead;
 
-    filename = makeSystemPath("ng-lo.rom");
-    file.open(filename, std::ios::in | std::ios::binary);
-    if (!file.is_open())
+    if (!fileRead(zoomRomFilename, neocd.memory.yZoomRom, Memory::YZOOMROM_SIZE, &reallyRead))
     {
-        LOG(LOG_ERROR, "Could not load Y Zoom ROM %s\n", filename.c_str());
+        LOG(LOG_ERROR, "Could not load Y Zoom ROM\n");
         return false;
     }
 
-    file.read(reinterpret_cast<char*>(neocd.memory.yZoomRom), Memory::YZOOMROM_SIZE);
-
-    if (file.gcount() < Memory::YZOOMROM_SIZE)
+    if (reallyRead < Memory::YZOOMROM_SIZE)
     {
-        LOG(LOG_ERROR, "ng-lo.rom should be exactly 65536 bytes!\n");
+        LOG(LOG_ERROR, "Y ZOOM ROM should be at least 65536 bytes!\n");
         return false;
     }
 
-    file.close();
     return true;
 }
 
@@ -171,10 +271,10 @@ static void patchROM_16(uint32_t address, uint16_t data)
     *reinterpret_cast<uint16_t*>(&neocd.memory.rom[address & 0x7FFFF]) = BIG_ENDIAN_WORD(data);
 }
 
-static void patchROM_32(uint32_t address, uint32_t data)
+/*static void patchROM_32(uint32_t address, uint32_t data)
 {
     *reinterpret_cast<uint32_t*>(&neocd.memory.rom[address & 0x7FFFF]) = BIG_ENDIAN_DWORD(data);
-}
+}*/
 
 static void patchROM_48(uint32_t address, uint32_t data1, uint16_t data2)
 {
@@ -195,12 +295,13 @@ static void disableSMKDANChecksum(uint32_t address)
 
 static void patchBIOS()
 {
-    bool isSMKDan = (biosList[biosIndex].filename == BIOS_SZ_FILENAME)
-                    || (biosList[biosIndex].filename == BIOS_SF_FILENAME)
-                    || (biosList[biosIndex].filename == BIOS_ST_FILENAME);
+    const KnownBiosListEntry* entry = biosList[biosIndex].biosEntry;
 
     if (neocd.biosType == NeoGeoCD::FrontLoader)
     {
+        // Patch the CD Recognition
+        patchROM_16(0xC10B64, 0x4E71);
+
         // Speed hacks to avoid busy looping
         if (cdSpeedHack)
         {
@@ -211,11 +312,14 @@ static void patchBIOS()
         }
 
         // If SMKDan, disable the BIOS checksum
-        if (isSMKDan)
+        if (entry->isSMKDan)
             disableSMKDANChecksum(0xC23EBE);
     }
     else if (neocd.biosType == NeoGeoCD::TopLoader)
     {
+        // Patch the CD Recognition
+        patchROM_16(0xC10436, 0x4E71);
+        
         // Speed hacks to avoid busy looping
         if (cdSpeedHack)
         {         
@@ -226,12 +330,13 @@ static void patchBIOS()
         }
 
         // If SMKDan, disable the BIOS checksum
-        if (isSMKDan)
+        if (entry->isSMKDan)
             disableSMKDANChecksum(0xC23FBE);
     }
     else if (neocd.biosType == NeoGeoCD::CDZ)
     {
-        // Patch the CD Recognition (It's done in the CD-ROM firmware, can't emulate)
+        // Patch the CD Recognition
+        patchROM_16(0xC0EB82, 0x4E71);
         patchROM_16(0xC0D280, 0x4E71);
 
         // Speed hacks to avoid busy looping
@@ -245,43 +350,36 @@ static void patchBIOS()
         }
 
         // If SMKDan, disable the BIOS checksum
-        if (isSMKDan)
+        if (entry->isSMKDan)
             disableSMKDANChecksum(0xC62BF4);
     }
 }
 
 static bool loadBIOS()
 {
-    std::ifstream file;
-    std::string filename;
-
     if (!biosList.size())
     {
         LOG(LOG_ERROR, "No BIOS detected!\n");
         return false;
     }
 
-    filename = makeSystemPath(biosList[biosIndex].filename);
-    file.open(filename, std::ios::in | std::ios::binary);
-    if (!file.is_open())
+    size_t reallyRead;
+
+    if (!fileRead(biosList[biosIndex].filename, neocd.memory.rom, Memory::ROM_SIZE, &reallyRead))
     {
-        LOG(LOG_ERROR, "Could not load BIOS %s\n", filename.c_str());
+        LOG(LOG_ERROR, "Could not load BIOS %s\n", biosList[biosIndex].filename.c_str());
         return false;
     }
 
-    file.read(reinterpret_cast<char*>(neocd.memory.rom), Memory::ROM_SIZE);
-
-    if (file.gcount() < Memory::ROM_SIZE)
+    if (reallyRead < Memory::ROM_SIZE)
     {
         LOG(LOG_ERROR, "neocd.rom should be exactly 524288 bytes!\n");
         return false;
     }
 
-    file.close();
+    neocd.biosType = biosList[biosIndex].biosEntry->type;
 
-    neocd.biosType = biosList[biosIndex].type;
-
-    // Swab the BIOS if needed
+    // Swap the BIOS if needed
     if (*reinterpret_cast<uint16_t*>(&neocd.memory.rom[0]) == 0x0010)
     {
         uint16_t* start = reinterpret_cast<uint16_t*>(&neocd.memory.rom[0]);
@@ -297,11 +395,11 @@ static bool loadBIOS()
     return true;
 }
 
-static int biosDescriptionToIndex(const char* description)
+static size_t biosDescriptionToIndex(const char* description)
 {
-    for (int result = 0; result < biosList.size(); ++result)
+    for (size_t result = 0; result < biosList.size(); ++result)
     {
-        if (!strcmp(description, biosList[result].description.c_str()))
+        if (!strcmp(description, biosList[result].biosEntry->description))
             return result;
     }
 
@@ -319,12 +417,12 @@ static void buildVariableList()
     if (biosList.size())
     {
         biosChoices = "BIOS Select; ";
-        biosChoices.append(biosList[0].description);
+        biosChoices.append(biosList[0].biosEntry->description);
 
         for (size_t i = 1; i < biosList.size(); ++i)
         {
             biosChoices.append("|");
-            biosChoices.append(biosList[i].description);
+            biosChoices.append(biosList[i].biosEntry->description);
         }
 
         variables.emplace_back(retro_variable{ BIOS_VARIABLE, biosChoices.c_str() });
@@ -339,30 +437,26 @@ static void buildVariableList()
 
 static void loadBackupRam()
 {
-    std::ifstream file;
-    std::string filename;
+    std::string filename = make_system_path("neocd.srm");
 
-    filename = makeSystemPath("neocd.srm");
-    file.open(filename, std::ios::in | std::ios::binary);
-    if (!file.is_open())
+    RFILE* file = filestream_open(filename.c_str(), RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (!file)
         return;
 
-    file.read(reinterpret_cast<char*>(neocd.memory.backupRam), Memory::BACKUPRAM_SIZE);
-    file.close();
+    filestream_read(file, neocd.memory.backupRam, Memory::BACKUPRAM_SIZE);
+    filestream_close(file);
 }
 
 static void saveBackupRam()
 {
-    std::ofstream file;
-    std::string filename;
+    std::string filename = make_system_path("neocd.srm");
 
-    filename = makeSystemPath("neocd.srm");
-    file.open(filename, std::ios::out | std::ios::binary);
-    if (!file.is_open())
+    RFILE* file = filestream_open(filename.c_str(), RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (!file)
         return;
 
-    file.write(reinterpret_cast<char*>(neocd.memory.backupRam), Memory::BACKUPRAM_SIZE);
-    file.close();
+    filestream_write(file, neocd.memory.backupRam, Memory::BACKUPRAM_SIZE);
+    filestream_close(file);
 }
 
 static void updateVariables(bool needReset)
@@ -393,7 +487,7 @@ static void updateVariables(bool needReset)
     
     if (libretro.environment(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
     {
-        int index = biosDescriptionToIndex(var.value);
+        size_t index = biosDescriptionToIndex(var.value);
 
         if (index != biosIndex)
         {
@@ -473,8 +567,8 @@ void retro_get_system_info(struct retro_system_info *info)
     std::memset(info, 0, sizeof(retro_system_info));
     
     info->library_name = "NeoCD";
-    info->library_version = "2018";
-    info->valid_extensions = "cue";
+    info->library_version = "2019";
+    info->valid_extensions = "cue|chd";
     info->need_fullpath = true;
 }
 
@@ -560,8 +654,12 @@ bool retro_load_game(const struct retro_game_info *info)
     if (!loadBIOS())
         return false;
 
-    if (!neocd.cdrom.loadCue(info->path))
+    if (!neocd.cdrom.loadCd(info->path))
+    {
+        // Call deinitialize to remove the audio thread because Retroarch won't call retro_deinit if load content failed
+        neocd.deinitialize();
         return false;
+    }
 
     // Load settings and reset
     updateVariables(true);
@@ -620,19 +718,19 @@ void retro_run(void)
     libretro.inputPoll();
     PROFILE_END(p_polling);
 
-    for (int i = 0; i < sizeof(padMap); i += 2)
+    for (size_t i = 0; i < sizeof(padMap); i += 2)
     {
         if (libretro.inputState(0, RETRO_DEVICE_JOYPAD, 0, padMap[i]))
             input1 &= ~padMap[i + 1];
     }
 
-    for (int i = 0; i < sizeof(padMap); i += 2)
+    for (size_t i = 0; i < sizeof(padMap); i += 2)
     {
         if (libretro.inputState(1, RETRO_DEVICE_JOYPAD, 0, padMap[i]))
             input2 &= ~padMap[i + 1];
     }
 
-    for (int i = 0; i < sizeof(padMap2); i += 3)
+    for (size_t i = 0; i < sizeof(padMap2); i += 3)
     {
         if (libretro.inputState(padMap2[i], RETRO_DEVICE_JOYPAD, 0, padMap2[i + 1]))
             input3 &= ~padMap2[i + 2];
@@ -668,29 +766,47 @@ void retro_init(void)
 {
     struct retro_log_callback log;
 
+    // Initialize the log interface
     if (libretro.environment(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log))
         libretro.log = log.log;
     else
         libretro.log = nullptr;
     
+    // Get the system directory 
     libretro.environment(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &systemDirectory);
 
-    // Initialize the emulation
+    // Initialize the CPU cores
     neocd.initialize();
 
     // Init the backup RAM area
     std::memset(neocd.memory.backupRam, 0, sizeof(Memory::BACKUPRAM_SIZE));
 
+    // Initialize VFS (If the call fails, fallback versions are used)
+    retro_vfs_interface_info vfs_iface_info;
+    vfs_iface_info.required_interface_version = 1;
+    
+    if (libretro.environment(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
+    {
+        LOG(LOG_INFO, "Using front end provided VFS routines\n");
+
+        filestream_vfs_init(&vfs_iface_info);
+        path_vfs_init(&vfs_iface_info);
+    }
+    else
+        LOG(LOG_INFO, "Using fallback VFS routines\n");
+
     // Search for all supported BIOSes
     lookForBIOS();
 
+    // Set the variables
     buildVariableList();
-
     libretro.environment(RETRO_ENVIRONMENT_SET_VARIABLES, reinterpret_cast<void*>(&variables[0]));
 }
 
 void retro_deinit(void)
 {
+    LOG(LOG_INFO, "NeoCD deinitializing\n");
+
     // Deinitialize the emulation
     neocd.deinitialize();
 
